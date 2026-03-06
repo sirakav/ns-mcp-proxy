@@ -157,8 +157,8 @@ class AuthState:
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
             try:
-                raw = await asyncio.wait_for(reader.read(8192), timeout=10)
-                first_line = raw.decode(errors="replace").split("\r\n")[0]
+                raw_line = await asyncio.wait_for(reader.readline(), timeout=10)
+                first_line = raw_line.decode(errors="replace").rstrip("\r\n")
                 # "GET /callback?code=xxx&state=yyy HTTP/1.1"
                 parts = first_line.split(" ")
                 params: dict[str, str] = {}
@@ -206,6 +206,7 @@ class AuthState:
                 await writer.drain()
             finally:
                 writer.close()
+                await writer.wait_closed()
 
         cb_server = await asyncio.start_server(
             _handle_connection, "127.0.0.1", CALLBACK_PORT
@@ -464,6 +465,16 @@ class ConnectionManager:
         if self._owner_task is None:
             return
 
+        if self._owner_task.done():
+            try:
+                self._owner_task.result()
+            except (Exception, asyncio.CancelledError) as exc:
+                log.warning("Connection owner task already exited: %s", exc)
+            self._owner_task = None
+            self._session = None
+            self.capabilities = None
+            return
+
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         await self._commands.put(_CloseCommand(future=future))
         await future
@@ -521,27 +532,34 @@ def _is_auth_error(result: types.CallToolResult) -> bool:
 # ---------------------------------------------------------------------------
 
 
-_AUTH_KEYWORDS = (
-    "401",
-    "unauthorized",
-    "unauthenticated",
-    "expired",
-    "forbidden",
-    # Raised by ConnectionManager.session when the owner task exited after a
-    # transport failure (e.g. the streamablehttp_client TaskGroup died on 401).
-    "not connected",
-)
+def _is_auth_exception(exc: BaseException) -> bool:
+    """
+    Return True if exc indicates the remote MCP server rejected the Bearer token.
 
+    Two precise cases are recognised:
 
-def _looks_like_auth_error(exc: BaseException) -> bool:
-    if any(kw in str(exc).lower() for kw in _AUTH_KEYWORDS):
+    1. httpx.HTTPStatusError with status 401 — the streamablehttp_client (which
+       uses httpx) raises this when the remote Go server returns HTTP 401 for any
+       auth failure (missing token, invalid JWT, expired token, backend rejection).
+
+    2. RuntimeError("Not connected to remote MCP server") — raised by
+       ConnectionManager.session when _session is None, which happens after the
+       connection owner task exits because the streamablehttp_client TaskGroup
+       crashed on a 401.
+
+    ExceptionGroup recursion is required because anyio / asyncio.TaskGroup wraps
+    transport failures in a group whose top-level message contains no auth signal.
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401:
         return True
-    # Recurse into sub-exceptions: asyncio.TaskGroup (Python 3.11+) and
-    # anyio wrap failures as ExceptionGroup whose top-level message is
-    # "unhandled errors in a TaskGroup" — no auth keywords at the top level.
+    if (
+        isinstance(exc, RuntimeError)
+        and exc.args == ("Not connected to remote MCP server",)
+    ):
+        return True
     subs = getattr(exc, "exceptions", None)
     if subs is not None:
-        return any(_looks_like_auth_error(sub) for sub in subs)
+        return any(_is_auth_exception(sub) for sub in subs)
     return False
 
 
@@ -576,7 +594,7 @@ async def _create_proxy_server(
             try:
                 return await coro_factory()
             except Exception as exc:  # noqa: BLE001
-                if attempt == 0 and _looks_like_auth_error(exc):
+                if attempt == 0 and _is_auth_exception(exc):
                     log.warning(
                         "Auth error on attempt %d (%s: %s) — re-authenticating...",
                         attempt,
