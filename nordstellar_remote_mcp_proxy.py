@@ -50,9 +50,10 @@ CALLBACK_PORT = 54321
 CALLBACK_URI = f"http://127.0.0.1:{CALLBACK_PORT}/callback"
 
 _SUCCESS_HTML = (
-    "<!DOCTYPE html><html><head><title>Login successful</title></head>"
+    "<!DOCTYPE html><html><head><title>Login successful</title>"
+    "<script>setTimeout(function(){ window.close(); }, 1500);</script></head>"
     "<body><h1>Login successful</h1>"
-    "<p>You can close this tab and return to your editor.</p></body></html>"
+    "<p>This tab will close automatically.</p></body></html>"
 )
 _ERROR_HTML = (
     "<!DOCTYPE html><html><head><title>Login failed</title></head>"
