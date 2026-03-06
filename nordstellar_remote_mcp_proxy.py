@@ -10,7 +10,7 @@ Usage:
   uvx --from git+https://github.com/sirakav/ns-mcp-proxy \\
       nordstellar-remote-mcp-proxy <remote_mcp_url>
 
-  e.g.  nordstellar-remote-mcp-proxy http://my-server:8080/mcp
+  e.g.  nordstellar-remote-mcp-proxy https://my-server:8080/mcp
 
 Cursor mcp.json:
   "nordstellar-graphql": {
@@ -18,7 +18,7 @@ Cursor mcp.json:
     "args": [
       "--from", "git+https://github.com/sirakav/ns-mcp-proxy",
       "nordstellar-remote-mcp-proxy",
-      "http://my-server:8080/mcp"
+      "https://my-server:8080/mcp"
     ]
   }
 """
@@ -52,6 +52,46 @@ log = logging.getLogger("nordstellar-proxy")
 BACKEND_BASE = "https://platform-api.nordstellar.com"
 CALLBACK_PORT = 54321
 
+_LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
+_ALLOWED_SCHEMES = {"http", "https"}
+
+
+_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+_JINJA_ENV = Environment(
+    loader=FileSystemLoader(_TEMPLATES_DIR),
+    autoescape=True,
+)
+
+
+def _validate_mcp_url(url: str) -> None:
+    """
+    Validate the remote MCP server URL.
+
+    Only http and https schemes are permitted. Plain HTTP is allowed only for
+    loopback addresses (localhost, 127.0.0.1, ::1, or the 127.x.x.x range)
+    because sending Bearer tokens over unencrypted connections on non-loopback
+    networks exposes credentials in cleartext.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        raise SystemExit(f"Invalid MCP URL: {exc}") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise SystemExit(
+            f"Invalid MCP URL scheme '{parsed.scheme}'. "
+            "Only 'https' and 'http' (loopback only) are allowed."
+        )
+
+    hostname = (parsed.hostname or "").lower()
+    is_loopback = hostname in _LOOPBACK_HOSTNAMES or hostname.startswith("127.")
+    if scheme == "http" and not is_loopback:
+        raise SystemExit(
+            f"Plain HTTP is not allowed for non-loopback host '{hostname}'. "
+            "Use HTTPS to protect Bearer token transmission."
+        )
+
 
 def _callback_uri(port: int) -> str:
     return f"http://127.0.0.1:{port}/callback"
@@ -62,16 +102,11 @@ def _oauth_state_from_auth_url(auth_url: str) -> str:
     states = params.get("state", [])
     return states[0] if states else ""
 
-_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-_JINJA_ENV = Environment(
-    loader=FileSystemLoader(_TEMPLATES_DIR),
-    autoescape=True,
-)
-
 
 # ---------------------------------------------------------------------------
-# Auth state — mirrors cmd/local/pkg/auth/
+# Auth state
 # ---------------------------------------------------------------------------
+
 
 class AuthState:
     """
@@ -124,33 +159,54 @@ class AuthState:
                 # "GET /callback?code=xxx&state=yyy HTTP/1.1"
                 parts = first_line.split(" ")
                 params: dict[str, str] = {}
-                if len(parts) >= 2:
+                if (
+                    len(parts) >= 3
+                    and parts[0] == "GET"
+                    and urllib.parse.urlparse(parts[1]).path == "/callback"
+                ):
                     qs = urllib.parse.urlparse(parts[1]).query
                     params = dict(urllib.parse.parse_qsl(qs))
+                else:
+                    writer.write(
+                        b"HTTP/1.1 400 Bad Request\r\n"
+                        b"Content-Type: text/plain; charset=utf-8\r\n"
+                        b"Connection: close\r\n\r\n"
+                        b"Bad Request"
+                    )
+                    await writer.drain()
+                    return
 
                 if "error" in params:
                     desc = params.get("error_description", "")
-                    body = _JINJA_ENV.get_template("login-error.html").render(
-                        message=f"{params['error']}: {desc}"
-                    ).encode()
+                    body = (
+                        _JINJA_ENV.get_template("login-error.html")
+                        .render(message=f"{params['error']}: {desc}")
+                        .encode()
+                    )
                     await result_queue.put({"error": params["error"]})
                 else:
-                    body = _JINJA_ENV.get_template("login-success.html").render().encode()
+                    body = (
+                        _JINJA_ENV.get_template("login-success.html").render().encode()
+                    )
                     await result_queue.put(
-                        {"code": params.get("code", ""), "state": params.get("state", "")}
+                        {
+                            "code": params.get("code", ""),
+                            "state": params.get("state", ""),
+                        }
                     )
 
                 writer.write(
                     b"HTTP/1.1 200 OK\r\n"
                     b"Content-Type: text/html; charset=utf-8\r\n"
-                    b"Connection: close\r\n\r\n"
-                    + body
+                    b"Connection: close\r\n\r\n" + body
                 )
                 await writer.drain()
             finally:
                 writer.close()
 
-        cb_server = await asyncio.start_server(_handle_connection, "127.0.0.1", CALLBACK_PORT)
+        cb_server = await asyncio.start_server(
+            _handle_connection, "127.0.0.1", CALLBACK_PORT
+        )
         try:
             callback_uri = _callback_uri(CALLBACK_PORT)
 
@@ -179,7 +235,9 @@ class AuthState:
 
             expected_state = _oauth_state_from_auth_url(auth_url)
             if not expected_state:
-                raise RuntimeError("initiate-login response did not include OAuth state")
+                raise RuntimeError(
+                    "initiate-login response did not include OAuth state"
+                )
 
             print("NordStellar: Opening browser for login...", file=sys.stderr)
             webbrowser.open(auth_url)
@@ -254,6 +312,7 @@ class AuthState:
 # ---------------------------------------------------------------------------
 # Connection manager — reconnectable StreamableHTTP ↔ ClientSession
 # ---------------------------------------------------------------------------
+
 
 class ConnectionManager:
     """
@@ -423,6 +482,7 @@ _ConnectionCommand = _ConnectCommand | _CloseCommand
 # Auth error detection
 # ---------------------------------------------------------------------------
 
+
 def _is_auth_error(result: types.CallToolResult) -> bool:
     """
     Detect the AUTH_NOT_AUTHENTICATED sentinel that the remote Go server
@@ -432,7 +492,10 @@ def _is_auth_error(result: types.CallToolResult) -> bool:
         if isinstance(content, types.TextContent):
             try:
                 data = json.loads(content.text)
-                if isinstance(data, dict) and data.get("error") == "AUTH_NOT_AUTHENTICATED":
+                if (
+                    isinstance(data, dict)
+                    and data.get("error") == "AUTH_NOT_AUTHENTICATED"
+                ):
                     return True
             except (json.JSONDecodeError, ValueError):
                 pass
@@ -442,6 +505,7 @@ def _is_auth_error(result: types.CallToolResult) -> bool:
 # ---------------------------------------------------------------------------
 # Proxy server factory
 # ---------------------------------------------------------------------------
+
 
 async def _create_proxy_server(
     conn: ConnectionManager, auth: AuthState, url: str
@@ -465,6 +529,7 @@ async def _create_proxy_server(
 
     # --- Tools ---
     if caps and caps.tools:
+
         async def _list_tools(_: Any) -> types.ServerResult:
             return types.ServerResult(await conn.session.list_tools())
 
@@ -481,14 +546,23 @@ async def _create_proxy_server(
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "call_tool(%s) raised on attempt %d: %s: %s",
-                        req.params.name, attempt, type(exc).__name__, exc,
+                        req.params.name,
+                        attempt,
+                        type(exc).__name__,
+                        exc,
                     )
                     # Only attempt reauth for exceptions that are plausibly
                     # auth/connection failures, not arbitrary SDK errors.
                     exc_str = str(exc).lower()
                     looks_like_auth = any(
                         kw in exc_str
-                        for kw in ("401", "unauthorized", "unauthenticated", "expired", "forbidden")
+                        for kw in (
+                            "401",
+                            "unauthorized",
+                            "unauthenticated",
+                            "expired",
+                            "forbidden",
+                        )
                     )
                     if attempt == 0 and looks_like_auth:
                         try:
@@ -524,6 +598,7 @@ async def _create_proxy_server(
 
     # --- Resources ---
     if caps and caps.resources:
+
         async def _list_resources(_: Any) -> types.ServerResult:
             return types.ServerResult(await conn.session.list_resources())
 
@@ -534,11 +609,14 @@ async def _create_proxy_server(
             return types.ServerResult(await conn.session.read_resource(req.params.uri))
 
         app.request_handlers[types.ListResourcesRequest] = _list_resources
-        app.request_handlers[types.ListResourceTemplatesRequest] = _list_resource_templates
+        app.request_handlers[types.ListResourceTemplatesRequest] = (
+            _list_resource_templates
+        )
         app.request_handlers[types.ReadResourceRequest] = _read_resource
 
     # --- Prompts ---
     if caps and caps.prompts:
+
         async def _list_prompts(_: Any) -> types.ServerResult:
             return types.ServerResult(await conn.session.list_prompts())
 
@@ -556,6 +634,7 @@ async def _create_proxy_server(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 async def _run(url: str) -> None:
     auth = AuthState()
@@ -588,6 +667,7 @@ def main() -> None:
         sys.exit(1)
 
     url = sys.argv[1]
+    _validate_mcp_url(url)
     log.info("Starting NordStellar MCP proxy → %s", url)
     asyncio.run(_run(url))
 
