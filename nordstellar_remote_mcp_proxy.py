@@ -24,16 +24,19 @@ Cursor mcp.json:
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 import json
 import logging
+from pathlib import Path
 import secrets
 import sys
+from typing import Any, TypeVar
 import urllib.parse
 import webbrowser
-from contextlib import AsyncExitStack
-from pathlib import Path
-from typing import Any
+
+T = TypeVar("T")
 
 import httpx
 from jinja2 import Environment, FileSystemLoader
@@ -511,15 +514,23 @@ def _is_auth_error(result: types.CallToolResult) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_AUTH_KEYWORDS = ("401", "unauthorized", "unauthenticated", "expired", "forbidden")
+
+
+def _looks_like_auth_error(exc: Exception) -> bool:
+    return any(kw in str(exc).lower() for kw in _AUTH_KEYWORDS)
+
+
 async def _create_proxy_server(
     conn: ConnectionManager, auth: AuthState, url: str
 ) -> server.Server:
     """
     Build a local MCP server whose handlers forward every call through conn.
 
-    Tool calls include a re-authentication retry: if the remote server returns
-    AUTH_NOT_AUTHENTICATED (or the connection raises), the proxy refreshes/re-logs
-    in, reconnects with the new JWT, and retries the call once.
+    All handlers include a re-authentication retry: if the remote server returns
+    AUTH_NOT_AUTHENTICATED or the connection raises an auth-related error, the
+    proxy refreshes/re-logs in, reconnects with the new JWT, and retries once.
+    This prevents Cursor from caching an empty capabilities set after a 401.
     """
     caps = conn.capabilities
     app: server.Server = server.Server(name=conn.server_name)
@@ -532,71 +543,61 @@ async def _create_proxy_server(
         await conn.connect(url, jwt)
         log.info("Reconnected with new token.")
 
-    # --- Tools ---
-    if caps and caps.tools:
-
-        async def _list_tools(_: Any) -> types.ServerResult:
-            return types.ServerResult(await conn.session.list_tools())
-
-        async def _call_tool(req: types.CallToolRequest) -> types.ServerResult:
-            for attempt in range(2):
-                try:
-                    result = await conn.session.call_tool(
-                        req.params.name, req.params.arguments or {}
-                    )
-                    if _is_auth_error(result) and attempt == 0:
-                        await _reauth_and_reconnect()
-                        continue
-                    return types.ServerResult(result)
-                except Exception as exc:  # noqa: BLE001
+    async def _with_reauth(coro_factory: "Callable[[], Awaitable[T]]") -> T:
+        """
+        Call coro_factory(). On an auth-related exception, re-authenticate,
+        reconnect, and retry once. Re-raises on the second failure.
+        """
+        for attempt in range(2):
+            try:
+                return await coro_factory()
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 0 and _looks_like_auth_error(exc):
                     log.warning(
-                        "call_tool(%s) raised on attempt %d: %s: %s",
-                        req.params.name,
+                        "Auth error on attempt %d (%s: %s) — re-authenticating...",
                         attempt,
                         type(exc).__name__,
                         exc,
                     )
-                    # Only attempt reauth for exceptions that are plausibly
-                    # auth/connection failures, not arbitrary SDK errors.
-                    exc_str = str(exc).lower()
-                    looks_like_auth = any(
-                        kw in exc_str
-                        for kw in (
-                            "401",
-                            "unauthorized",
-                            "unauthenticated",
-                            "expired",
-                            "forbidden",
-                        )
-                    )
-                    if attempt == 0 and looks_like_auth:
-                        try:
-                            await _reauth_and_reconnect()
-                            continue
-                        except Exception as reauth_exc:
-                            log.error("Re-authentication failed: %s", reauth_exc)
-                    return types.ServerResult(
-                        types.CallToolResult(
-                            content=[
-                                types.TextContent(
-                                    type="text",
-                                    text="Tool call failed. Please try again or restart the MCP server.",
-                                )
-                            ],
-                            isError=True,
-                        )
-                    )
-            return types.ServerResult(
-                types.CallToolResult(
-                    content=[
-                        types.TextContent(
-                            type="text",
-                            text="Authentication failed after retry. Please restart the MCP server.",
-                        )
-                    ],
-                    isError=True,
+                    try:
+                        await _reauth_and_reconnect()
+                    except Exception as reauth_exc:
+                        log.error("Re-authentication failed: %s", reauth_exc)
+                        raise exc from reauth_exc
+                    continue
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    # --- Tools ---
+    if caps and caps.tools:
+
+        async def _list_tools(_: Any) -> types.ServerResult:
+            return types.ServerResult(await _with_reauth(conn.session.list_tools))
+
+        async def _call_tool(req: types.CallToolRequest) -> types.ServerResult:
+            async def _do() -> types.CallToolResult:
+                result = await conn.session.call_tool(
+                    req.params.name, req.params.arguments or {}
                 )
-            )
+                if _is_auth_error(result):
+                    raise RuntimeError("AUTH_NOT_AUTHENTICATED")
+                return result
+
+            try:
+                return types.ServerResult(await _with_reauth(_do))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("call_tool(%s) failed: %s: %s", req.params.name, type(exc).__name__, exc)
+                return types.ServerResult(
+                    types.CallToolResult(
+                        content=[
+                            types.TextContent(
+                                type="text",
+                                text="Tool call failed. Please try again or restart the MCP server.",
+                            )
+                        ],
+                        isError=True,
+                    )
+                )
 
         app.request_handlers[types.ListToolsRequest] = _list_tools
         app.request_handlers[types.CallToolRequest] = _call_tool
@@ -605,13 +606,19 @@ async def _create_proxy_server(
     if caps and caps.resources:
 
         async def _list_resources(_: Any) -> types.ServerResult:
-            return types.ServerResult(await conn.session.list_resources())
+            return types.ServerResult(await _with_reauth(conn.session.list_resources))
 
         async def _list_resource_templates(_: Any) -> types.ServerResult:
-            return types.ServerResult(await conn.session.list_resource_templates())
+            return types.ServerResult(
+                await _with_reauth(conn.session.list_resource_templates)
+            )
 
         async def _read_resource(req: types.ReadResourceRequest) -> types.ServerResult:
-            return types.ServerResult(await conn.session.read_resource(req.params.uri))
+            return types.ServerResult(
+                await _with_reauth(
+                    lambda: conn.session.read_resource(req.params.uri)
+                )
+            )
 
         app.request_handlers[types.ListResourcesRequest] = _list_resources
         app.request_handlers[types.ListResourceTemplatesRequest] = (
@@ -623,11 +630,15 @@ async def _create_proxy_server(
     if caps and caps.prompts:
 
         async def _list_prompts(_: Any) -> types.ServerResult:
-            return types.ServerResult(await conn.session.list_prompts())
+            return types.ServerResult(await _with_reauth(conn.session.list_prompts))
 
         async def _get_prompt(req: types.GetPromptRequest) -> types.ServerResult:
             return types.ServerResult(
-                await conn.session.get_prompt(req.params.name, req.params.arguments)
+                await _with_reauth(
+                    lambda: conn.session.get_prompt(
+                        req.params.name, req.params.arguments
+                    )
+                )
             )
 
         app.request_handlers[types.ListPromptsRequest] = _list_prompts
