@@ -20,7 +20,7 @@ The remote Go server (`cmd/remote-hack`) accepts the Bearer token and converts i
   "nordstellar-graphql": {
     "command": "uvx",
     "args": [
-      "--from", "git+https://github.com/vakarisnoreika/nordstellar-remote-mcp-proxy",
+      "--from", "git+https://github.com/sirakav/nordstellar-remote-mcp-proxy",
       "nordstellar-remote-mcp-proxy",
       "http://my-server:8080/mcp"
     ]
