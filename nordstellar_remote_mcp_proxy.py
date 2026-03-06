@@ -501,7 +501,12 @@ async def _create_proxy_server(
                             log.error("Re-authentication failed: %s", reauth_exc)
                     return types.ServerResult(
                         types.CallToolResult(
-                            content=[types.TextContent(type="text", text=str(exc))],
+                            content=[
+                                types.TextContent(
+                                    type="text",
+                                    text="Tool call failed. Please try again or restart the MCP server.",
+                                )
+                            ],
                             isError=True,
                         )
                     )
