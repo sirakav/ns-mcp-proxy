@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "nordstellar-remote-mcp-proxy"
+version = "0.1.0"
+description = "Auth proxy that forwards MCP tool calls to a remote NordStellar MCP server"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.6.0",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+nordstellar-remote-mcp-proxy = "nordstellar_remote_mcp_proxy:main"
+
+[tool.setuptools]
+py-modules = ["nordstellar_remote_mcp_proxy"]
