@@ -31,7 +31,9 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import platform
 import secrets
+import subprocess
 import sys
 import time
 from typing import Any, TypeVar
@@ -129,6 +131,131 @@ def _jwt_exp(jwt: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Persistent cookie storage (macOS Keychain with in-memory fallback)
+# ---------------------------------------------------------------------------
+
+_KEYCHAIN_SERVICE = "nordstellar-mcp-proxy"
+_KEYCHAIN_ACCOUNT = "cookies"
+
+
+class _CookieBackend:
+    """No-op backend — in-memory only, no persistence across restarts."""
+
+    name = "in-memory"
+
+    def save(self, cookies: dict[str, Any]) -> None:
+        pass
+
+    def load(self) -> dict[str, Any] | None:
+        return None
+
+    def clear(self) -> None:
+        pass
+
+
+class _MacOSKeychainBackend(_CookieBackend):
+    """Persists cookies in the macOS Keychain via the /usr/bin/security CLI."""
+
+    name = "macOS Keychain"
+
+    def save(self, cookies: dict[str, Any]) -> None:
+        value = json.dumps(cookies)
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["security", "add-generic-password",
+             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT, "-w"],
+            input=value, capture_output=True, check=True, text=True,
+        )
+
+    def load(self) -> dict[str, Any] | None:
+        result = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT, "-w"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return json.loads(result.stdout.strip())
+
+    def clear(self) -> None:
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT],
+            capture_output=True,
+        )
+
+
+def _create_cookie_backend() -> _CookieBackend:
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            subprocess.run(["security", "help"], capture_output=True, check=False)
+            return _MacOSKeychainBackend()
+        except FileNotFoundError:
+            log.warning("macOS detected but /usr/bin/security not found")
+    log.info(
+        "No secure cookie store available for %s, using in-memory only", system
+    )
+    return _CookieBackend()
+
+
+class CookieStore:
+    """
+    Safe wrapper around a platform-specific credential backend.
+
+    Every public method catches all exceptions so that a Keychain failure
+    never prevents the proxy from working — it just falls back to the
+    current in-memory-only behaviour.
+    """
+
+    def __init__(self) -> None:
+        self._backend = _create_cookie_backend()
+        log.info("Cookie store backend: %s", self._backend.name)
+
+    def save(self, client: httpx.AsyncClient) -> None:
+        cookies: dict[str, Any] = {}
+        for cookie in client.cookies.jar:
+            key = f"{cookie.domain}:{cookie.path}:{cookie.name}"
+            cookies[key] = {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+        try:
+            self._backend.save(cookies)
+        except Exception as exc:
+            log.debug("Cookie store save failed, falling back to in-memory: %s", exc)
+
+    def load(self, client: httpx.AsyncClient) -> bool:
+        try:
+            cookies = self._backend.load()
+            if not cookies:
+                return False
+            for data in cookies.values():
+                client.cookies.set(
+                    data["name"],
+                    data["value"],
+                    domain=data["domain"],
+                    path=data["path"],
+                )
+            return True
+        except Exception as exc:
+            log.debug("Cookie store load failed, falling back to in-memory: %s", exc)
+            return False
+
+    def clear(self) -> None:
+        try:
+            self._backend.clear()
+        except Exception as exc:
+            log.debug("Cookie store clear failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Auth state
 # ---------------------------------------------------------------------------
 
@@ -148,6 +275,9 @@ class AuthState:
     def __init__(self) -> None:
         # follow_redirects=True for all calls except initiate-login (overridden per-request)
         self._client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+        self._cookie_store = CookieStore()
+        if self._cookie_store.load(self._client):
+            log.info("Restored session from secure storage")
 
     def is_authenticated(self) -> bool:
         return bool(self._client.cookies.get("AccessToken"))
@@ -159,7 +289,10 @@ class AuthState:
                 f"{BACKEND_BASE}/auth/refresh-token",
                 headers={"Content-Type": "application/json"},
             )
-            return resp.status_code == 200 and self.is_authenticated()
+            if resp.status_code == 200 and self.is_authenticated():
+                self._cookie_store.save(self._client)
+                return True
+            return False
         except Exception as exc:
             log.debug("Refresh request failed: %s", exc)
             return False
@@ -294,6 +427,7 @@ class AuthState:
             raise RuntimeError(
                 f"Code exchange failed (HTTP {login_resp.status_code}): {login_resp.text}"
             )
+        self._cookie_store.save(self._client)
         print("NordStellar: Login successful.", file=sys.stderr)
 
     def invalidate(self) -> None:
