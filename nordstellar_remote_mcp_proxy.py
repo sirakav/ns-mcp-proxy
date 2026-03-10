@@ -31,9 +31,7 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-import platform
 import secrets
-import subprocess
 import sys
 import time
 from typing import Any, TypeVar
@@ -44,6 +42,8 @@ T = TypeVar("T")
 
 import httpx
 from jinja2 import Environment, FileSystemLoader
+import keyring
+import keyring.errors
 from mcp import server, types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -131,11 +131,11 @@ def _jwt_exp(jwt: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Persistent cookie storage (macOS Keychain with in-memory fallback)
+# Persistent cookie storage (keyring with in-memory fallback)
 # ---------------------------------------------------------------------------
 
-_KEYCHAIN_SERVICE = "nordstellar-mcp-proxy"
-_KEYCHAIN_ACCOUNT = "cookies"
+_KEYRING_SERVICE = "NordStellar MCP"
+_KEYRING_ACCOUNT = "session-cookies"
 
 
 class _CookieBackend:
@@ -153,54 +153,55 @@ class _CookieBackend:
         pass
 
 
-class _MacOSKeychainBackend(_CookieBackend):
-    """Persists cookies in the macOS Keychain via the /usr/bin/security CLI."""
+class _KeyringBackend(_CookieBackend):
+    """
+    Persists cookies via the ``keyring`` library.
 
-    name = "macOS Keychain"
+    Uses the platform's native credential store:
+      - macOS: Keychain (backward-compatible with previous /usr/bin/security entries)
+      - Windows: Credential Locker
+      - Linux: Freedesktop Secret Service (GNOME Keyring / KWallet)
+    """
+
+    def __init__(self, backend_name: str) -> None:
+        self.name = backend_name
 
     def save(self, cookies: dict[str, Any]) -> None:
-        value = json.dumps(cookies)
-        subprocess.run(
-            ["security", "delete-generic-password",
-             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT],
-            capture_output=True,
-        )
-        subprocess.run(
-            ["security", "add-generic-password",
-             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT, "-w"],
-            input=value, capture_output=True, check=True, text=True,
-        )
+        try:
+            keyring.delete_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+        except keyring.errors.PasswordDeleteError:
+            pass
+        keyring.set_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT, json.dumps(cookies))
 
     def load(self) -> dict[str, Any] | None:
-        result = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT, "-w"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
+        value = keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+        if not value:
             return None
-        return json.loads(result.stdout.strip())
+        return json.loads(value)
 
     def clear(self) -> None:
-        subprocess.run(
-            ["security", "delete-generic-password",
-             "-s", _KEYCHAIN_SERVICE, "-a", _KEYCHAIN_ACCOUNT],
-            capture_output=True,
-        )
+        try:
+            keyring.delete_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+        except keyring.errors.PasswordDeleteError:
+            pass
 
 
 def _create_cookie_backend() -> _CookieBackend:
-    system = platform.system()
-    if system == "Darwin":
-        try:
-            subprocess.run(["security", "help"], capture_output=True, check=False)
-            return _MacOSKeychainBackend()
-        except FileNotFoundError:
-            log.warning("macOS detected but /usr/bin/security not found")
-    log.info(
-        "No secure cookie store available for %s, using in-memory only", system
-    )
-    return _CookieBackend()
+    try:
+        kr = keyring.get_keyring()
+        backend_name = type(kr).__name__
+
+        # Null backend means no usable secure store is available.
+        if backend_name == "NullKeyring":
+            raise RuntimeError("keyring resolved to NullKeyring")
+
+        # Smoke-test: attempt a read to verify the backend works.
+        keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+
+        return _KeyringBackend(backend_name)
+    except Exception as exc:
+        log.info("keyring unavailable (%s), using in-memory cookie store", exc)
+        return _CookieBackend()
 
 
 class CookieStore:
@@ -228,8 +229,9 @@ class CookieStore:
             }
         try:
             self._backend.save(cookies)
+            log.info("Saved %d cookie(s) to %s", len(cookies), self._backend.name)
         except Exception as exc:
-            log.debug("Cookie store save failed, falling back to in-memory: %s", exc)
+            log.warning("Cookie store save failed, falling back to in-memory: %s", exc)
 
     def load(self, client: httpx.AsyncClient) -> bool:
         try:
@@ -243,9 +245,10 @@ class CookieStore:
                     domain=data["domain"],
                     path=data["path"],
                 )
+            log.info("Loaded %d cookie(s) from %s", len(cookies), self._backend.name)
             return True
         except Exception as exc:
-            log.debug("Cookie store load failed, falling back to in-memory: %s", exc)
+            log.warning("Cookie store load failed, falling back to in-memory: %s", exc)
             return False
 
     def clear(self) -> None:

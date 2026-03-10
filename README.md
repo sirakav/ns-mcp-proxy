@@ -41,6 +41,10 @@ Ask your AI assistant things like “What projects do I have?” or “Show me r
 
 - [uv](https://docs.astral.sh/uv/) installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Python 3.10 or newer (uv handles this automatically)
+- [keyring](https://pypi.org/project/keyring/) — installed automatically as a dependency. Provides persistent, secure credential storage using each platform's native backend:
+  - **macOS** — Keychain
+  - **Windows** — Credential Locker
+  - **Linux** — Freedesktop Secret Service (GNOME Keyring / KWallet). Requires `gnome-keyring` or `kwallet` to be available; on headless systems, see the [keyring docs](https://pypi.org/project/keyring/) for setup instructions.
 
 ## Need help?
 
