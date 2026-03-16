@@ -59,7 +59,6 @@ logging.basicConfig(
 log = logging.getLogger("nordstellar-proxy")
 
 BACKEND_BASE = "https://platform-api.nordstellar.com"
-CALLBACK_PORT = 54321
 
 _LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -304,7 +303,7 @@ class AuthState:
     async def _login_flow(self) -> None:
         """
         Full browser OAuth flow, mirroring login.go:
-          1. Bind local callback server on 127.0.0.1:54321
+          1. Bind local callback server on 127.0.0.1 (random port)
           2. GET /auth/initiate-login/{encoded_redirect} (no redirects)
           3. Open Keycloak URL in the browser
           4. Receive OAuth callback (code + state)
@@ -368,10 +367,11 @@ class AuthState:
                 await writer.wait_closed()
 
         cb_server = await asyncio.start_server(
-            _handle_connection, "127.0.0.1", CALLBACK_PORT
+            _handle_connection, "127.0.0.1", 0
         )
         try:
-            callback_uri = _callback_uri(CALLBACK_PORT)
+            callback_port = cb_server.sockets[0].getsockname()[1]
+            callback_uri = _callback_uri(callback_port)
 
             encoded = urllib.parse.quote(callback_uri, safe="")
             init_resp = await self._client.get(
