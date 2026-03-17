@@ -718,29 +718,19 @@ def _is_auth_error(result: types.CallToolResult) -> bool:
 
 def _is_auth_exception(exc: BaseException) -> bool:
     """
-    Return True if exc indicates the remote MCP server rejected the Bearer token
-    or that the remote session has been terminated and reconnection is needed.
+    Return True if exc indicates the remote MCP server rejected the Bearer token.
 
-    Four precise cases are recognised:
+    Recognised cases:
 
-    1. httpx.HTTPStatusError with status 401 — the streamablehttp_client (which
-       uses httpx) raises this when the remote Go server returns HTTP 401 for any
-       auth failure (missing token, invalid JWT, expired token, backend rejection).
+    1. httpx.HTTPStatusError with status 401 — the streamablehttp_client raises
+       this when the remote Go server returns HTTP 401 (missing/invalid/expired JWT).
 
     2. MCPError("Session terminated") — the streamablehttp_client converts a 404
-       response from the remote into MCPError(code=INVALID_REQUEST, message=
-       "Session terminated") sent through the read stream. This happens when the
-       remote server's session has expired or restarted.
+       into this error when the remote server's session has expired or restarted.
 
     3. RuntimeError("AUTH_NOT_AUTHENTICATED") — raised by _call_tool's _do()
        when the Go tool returns an AUTH_NOT_AUTHENTICATED sentinel in its content
-       (HTTP 200). This happens within the tokenauth cache window when the backend
-       rejects the token mid-request after tokenauth has already accepted it.
-
-    4. RuntimeError("Not connected to remote MCP server") — raised by
-       ConnectionManager.session when _session is None, which happens after the
-       connection owner task exits because the streamablehttp_client TaskGroup
-       crashed on a 401.
+       (HTTP 200, within the tokenauth cache window).
 
     ExceptionGroup recursion is required because anyio / asyncio.TaskGroup wraps
     transport failures in a group whose top-level message contains no auth signal.
@@ -749,9 +739,33 @@ def _is_auth_exception(exc: BaseException) -> bool:
         return True
     if isinstance(exc, McpError) and exc.message == "Session terminated":
         return True
-    if isinstance(exc, RuntimeError) and exc.args in (
-        ("AUTH_NOT_AUTHENTICATED",),
-        ("Not connected to remote MCP server",),
+    if isinstance(exc, RuntimeError) and exc.args == ("AUTH_NOT_AUTHENTICATED",):
+        return True
+    subs = getattr(exc, "exceptions", None)
+    if subs is not None:
+        return any(_is_auth_exception(sub) for sub in subs)
+    return False
+
+
+def _is_transport_exception(exc: BaseException) -> bool:
+    """
+    Return True if exc indicates a transport-level connection loss (not an auth rejection).
+
+    Recognised cases:
+
+    1. RuntimeError("Not connected to remote MCP server") — raised by
+       ConnectionManager.session when _session is None after the connection owner
+       task exits (e.g. the streamablehttp_client TaskGroup crashed).
+
+    2. anyio.ClosedResourceError / BrokenResourceError / EndOfStream — the
+       underlying transport stream was closed by a network timeout, server restart,
+       load balancer drop, or keep-alive expiration.
+
+    These errors are recoverable via reconnection without re-authentication when
+    the JWT is still valid.
+    """
+    if isinstance(exc, RuntimeError) and exc.args == (
+        "Not connected to remote MCP server",
     ):
         return True
     if isinstance(
@@ -760,12 +774,20 @@ def _is_auth_exception(exc: BaseException) -> bool:
         return True
     subs = getattr(exc, "exceptions", None)
     if subs is not None:
-        return any(_is_auth_exception(sub) for sub in subs)
+        return any(_is_transport_exception(sub) for sub in subs)
     return False
 
 
+def _is_recoverable_exception(exc: BaseException) -> bool:
+    """Return True if the error can be recovered via reconnection (with or without re-auth)."""
+    return _is_auth_exception(exc) or _is_transport_exception(exc)
+
+
 async def _create_proxy_server(
-    conn: ConnectionManager, auth: AuthState, url: str
+    conn: ConnectionManager,
+    auth: AuthState,
+    url: str,
+    reauth_lock: asyncio.Lock,
 ) -> server.Server:
     """
     Build a local MCP server whose handlers forward every call through conn.
@@ -777,31 +799,35 @@ async def _create_proxy_server(
     """
     caps = conn.capabilities
     app: server.Server = server.Server(name=conn.server_name)
-    _reauth_lock = asyncio.Lock()
+    _reauth_lock = reauth_lock
 
     async def _reauth_and_reconnect() -> None:
         async with _reauth_lock:
+            need_reauth = True
             if auth.is_authenticated():
                 try:
                     jwt = auth.extract_jwt()
                     exp = _jwt_exp(jwt)
                     if exp is not None and exp - time.time() > _REFRESH_SKEW_SECONDS:
-                        log.info("Skipping re-auth — token already refreshed by another handler.")
-                        return
+                        need_reauth = False
                 except Exception:
                     pass
 
-            log.info("Auth/session error detected — re-authenticating and reconnecting...")
-            auth.invalidate()
-            await auth.ensure_authenticated()
+            if need_reauth:
+                log.info("Auth/session error detected — re-authenticating and reconnecting...")
+                auth.invalidate()
+                await auth.ensure_authenticated()
+            else:
+                log.info("Token still valid — reconnecting without re-authentication...")
+
             jwt = auth.extract_jwt()
             await conn.connect(url, jwt)
-            log.info("Reconnected with refreshed token.")
+            log.info("Reconnected%s.", " with refreshed token" if need_reauth else "")
 
     async def _with_reauth(coro_factory: "Callable[[], Awaitable[T]]") -> T:
         """
-        Call coro_factory(). On an auth-related exception, re-authenticate,
-        reconnect, and retry once. Re-raises on the second failure.
+        Call coro_factory(). On a recoverable exception (auth or transport),
+        re-authenticate/reconnect and retry once. Re-raises on the second failure.
         """
         for attempt in range(2):
             try:
@@ -814,13 +840,21 @@ async def _create_proxy_server(
                         type(exc).__name__,
                         exc,
                     )
-                    try:
-                        await _reauth_and_reconnect()
-                    except Exception as reauth_exc:
-                        log.error("Re-authentication failed: %s", reauth_exc)
-                        raise exc from reauth_exc
-                    continue
-                raise
+                elif attempt == 0 and _is_transport_exception(exc):
+                    log.warning(
+                        "Transport error on attempt %d (%s: %s) — reconnecting...",
+                        attempt,
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    raise
+                try:
+                    await _reauth_and_reconnect()
+                except Exception as reauth_exc:
+                    log.error("Recovery failed: %s", reauth_exc)
+                    raise exc from reauth_exc
+                continue
         raise RuntimeError("unreachable")  # pragma: no cover
 
     # --- Tools ---
@@ -924,7 +958,10 @@ async def _create_proxy_server(
 
 
 async def _token_refresh_daemon(
-    auth: AuthState, conn: ConnectionManager, url: str
+    auth: AuthState,
+    conn: ConnectionManager,
+    url: str,
+    reauth_lock: asyncio.Lock,
 ) -> None:
     """
     Background task that proactively refreshes the AccessToken before it expires.
@@ -932,25 +969,35 @@ async def _token_refresh_daemon(
     Strategy (mirrors TokenRefreshService in the .NET backend):
       1. Decode the current JWT's exp claim.
       2. Sleep until exp - REFRESH_SKEW_SECONDS.
-      3. Call POST /auth/refresh-token (via _refresh_session).
-      4. On success, reconnect ConnectionManager with the new JWT.
-      5. Repeat forever; on transient errors, retry after 30 s.
+      3. Acquire reauth_lock (shared with request handlers).
+      4. Call POST /auth/refresh-token (via _refresh_session).
+      5. On success, reconnect ConnectionManager with the new JWT.
+      6. Repeat forever; on transient errors, retry with exponential backoff.
     """
+    consecutive_failures = 0
     while True:
         try:
             jwt = auth.extract_jwt()
         except Exception:
-            await asyncio.sleep(30)
+            consecutive_failures += 1
+            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
+            await asyncio.sleep(backoff)
             continue
 
         exp = _jwt_exp(jwt)
         if exp is None:
-            log.warning("Token refresh daemon: could not read JWT exp, retrying in 30s")
-            await asyncio.sleep(30)
+            consecutive_failures += 1
+            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
+            log.warning(
+                "Token refresh daemon: could not read JWT exp, retrying in %.0fs",
+                backoff,
+            )
+            await asyncio.sleep(backoff)
             continue
 
         sleep_for = exp - time.time() - _REFRESH_SKEW_SECONDS
         if sleep_for > 0:
+            consecutive_failures = 0
             log.debug(
                 "Token refresh daemon: next refresh in %.1fs (exp=%s skew=%ds)",
                 sleep_for,
@@ -960,25 +1007,55 @@ async def _token_refresh_daemon(
             await asyncio.sleep(sleep_for)
 
         log.info("Token refresh daemon: proactively refreshing token...")
+        refreshed = False
         try:
-            refreshed = await auth._refresh_session()
-            if refreshed:
-                new_jwt = auth.extract_jwt()
-                await conn.connect(url, new_jwt)
-                log.info(
-                    "Token refresh daemon: token refreshed and connection updated."
-                )
-            else:
-                log.warning(
-                    "Token refresh daemon: refresh_session returned False "
-                    "(refresh token may be expired), retrying in 30s"
-                )
-                await asyncio.sleep(30)
+            async with reauth_lock:
+                try:
+                    current_jwt = auth.extract_jwt()
+                    current_exp = _jwt_exp(current_jwt)
+                    if (
+                        current_exp is not None
+                        and current_exp - time.time() > _REFRESH_SKEW_SECONDS
+                    ):
+                        log.info(
+                            "Token refresh daemon: token already refreshed by "
+                            "another actor, skipping."
+                        )
+                        consecutive_failures = 0
+                        continue
+                except Exception:
+                    pass
+
+                refreshed = await auth._refresh_session()
+                if refreshed:
+                    new_jwt = auth.extract_jwt()
+                    await conn.connect(url, new_jwt)
+                    log.info(
+                        "Token refresh daemon: token refreshed and connection updated."
+                    )
+                    consecutive_failures = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("Token refresh daemon: error during refresh: %s", exc)
-            await asyncio.sleep(30)
+            consecutive_failures += 1
+            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
+            log.warning(
+                "Token refresh daemon: error during refresh: %s, retrying in %.0fs",
+                exc,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            continue
+
+        if not refreshed:
+            consecutive_failures += 1
+            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
+            log.warning(
+                "Token refresh daemon: refresh failed (refresh token may be expired), "
+                "retrying in %.0fs",
+                backoff,
+            )
+            await asyncio.sleep(backoff)
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1066,7 @@ async def _token_refresh_daemon(
 async def _run(url: str) -> None:
     auth = AuthState()
     conn = ConnectionManager()
+    reauth_lock = asyncio.Lock()
     refresh_task: asyncio.Task[None] | None = None
     try:
         for attempt in range(2):
@@ -998,7 +1076,7 @@ async def _run(url: str) -> None:
                 await conn.connect(url, jwt)
                 break
             except Exception as exc:
-                if attempt == 0 and _is_auth_exception(exc):
+                if attempt == 0 and _is_recoverable_exception(exc):
                     log.warning(
                         "Initial connection failed with auth error, re-authenticating..."
                     )
@@ -1007,11 +1085,11 @@ async def _run(url: str) -> None:
                 raise
 
         refresh_task = asyncio.create_task(
-            _token_refresh_daemon(auth, conn, url),
+            _token_refresh_daemon(auth, conn, url, reauth_lock),
             name="nordstellar-proxy-token-refresh-daemon",
         )
 
-        app = await _create_proxy_server(conn, auth, url)
+        app = await _create_proxy_server(conn, auth, url, reauth_lock)
 
         async with stdio_server() as (read_stream, write_stream):
             await app.run(
