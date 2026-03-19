@@ -788,6 +788,7 @@ async def _create_proxy_server(
     auth: AuthState,
     url: str,
     reauth_lock: asyncio.Lock,
+    token_refreshed: asyncio.Event,
 ) -> server.Server:
     """
     Build a local MCP server whose handlers forward every call through conn.
@@ -817,6 +818,7 @@ async def _create_proxy_server(
                 log.info("Auth/session error detected — re-authenticating and reconnecting...")
                 auth.invalidate()
                 await auth.ensure_authenticated()
+                token_refreshed.set()
             else:
                 log.info("Token still valid — reconnecting without re-authentication...")
 
@@ -962,6 +964,7 @@ async def _token_refresh_daemon(
     conn: ConnectionManager,
     url: str,
     reauth_lock: asyncio.Lock,
+    token_refreshed: asyncio.Event,
 ) -> None:
     """
     Background task that proactively refreshes the AccessToken before it expires.
@@ -972,32 +975,33 @@ async def _token_refresh_daemon(
       3. Acquire reauth_lock (shared with request handlers).
       4. Call POST /auth/refresh-token (via _refresh_session).
       5. On success, reconnect ConnectionManager with the new JWT.
-      6. Repeat forever; on transient errors, retry with exponential backoff.
+      6. On failure, suspend until a request handler re-authenticates via browser
+         login and signals token_refreshed.
     """
-    consecutive_failures = 0
+
+    async def _suspend() -> None:
+        log.warning(
+            "Token refresh daemon: refresh token expired. "
+            "Suspending until next successful re-authentication."
+        )
+        token_refreshed.clear()
+        await token_refreshed.wait()
+        log.info("Token refresh daemon: resuming after re-authentication.")
+
     while True:
         try:
             jwt = auth.extract_jwt()
         except Exception:
-            consecutive_failures += 1
-            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
-            await asyncio.sleep(backoff)
+            await _suspend()
             continue
 
         exp = _jwt_exp(jwt)
         if exp is None:
-            consecutive_failures += 1
-            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
-            log.warning(
-                "Token refresh daemon: could not read JWT exp, retrying in %.0fs",
-                backoff,
-            )
-            await asyncio.sleep(backoff)
+            await _suspend()
             continue
 
         sleep_for = exp - time.time() - _REFRESH_SKEW_SECONDS
         if sleep_for > 0:
-            consecutive_failures = 0
             log.debug(
                 "Token refresh daemon: next refresh in %.1fs (exp=%s skew=%ds)",
                 sleep_for,
@@ -1021,7 +1025,6 @@ async def _token_refresh_daemon(
                             "Token refresh daemon: token already refreshed by "
                             "another actor, skipping."
                         )
-                        consecutive_failures = 0
                         continue
                 except Exception:
                     pass
@@ -1033,29 +1036,15 @@ async def _token_refresh_daemon(
                     log.info(
                         "Token refresh daemon: token refreshed and connection updated."
                     )
-                    consecutive_failures = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            consecutive_failures += 1
-            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
-            log.warning(
-                "Token refresh daemon: error during refresh: %s, retrying in %.0fs",
-                exc,
-                backoff,
-            )
-            await asyncio.sleep(backoff)
+            log.warning("Token refresh daemon: error during refresh: %s", exc)
+            await _suspend()
             continue
 
         if not refreshed:
-            consecutive_failures += 1
-            backoff = min(30 * (2 ** (consecutive_failures - 1)), 300)
-            log.warning(
-                "Token refresh daemon: refresh failed (refresh token may be expired), "
-                "retrying in %.0fs",
-                backoff,
-            )
-            await asyncio.sleep(backoff)
+            await _suspend()
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1056,7 @@ async def _run(url: str) -> None:
     auth = AuthState()
     conn = ConnectionManager()
     reauth_lock = asyncio.Lock()
+    token_refreshed = asyncio.Event()
     refresh_task: asyncio.Task[None] | None = None
     try:
         for attempt in range(2):
@@ -1085,11 +1075,11 @@ async def _run(url: str) -> None:
                 raise
 
         refresh_task = asyncio.create_task(
-            _token_refresh_daemon(auth, conn, url, reauth_lock),
+            _token_refresh_daemon(auth, conn, url, reauth_lock, token_refreshed),
             name="nordstellar-proxy-token-refresh-daemon",
         )
 
-        app = await _create_proxy_server(conn, auth, url, reauth_lock)
+        app = await _create_proxy_server(conn, auth, url, reauth_lock, token_refreshed)
 
         async with stdio_server() as (read_stream, write_stream):
             await app.run(
