@@ -26,7 +26,7 @@ Cursor mcp.json:
 import asyncio
 import base64
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 import json
 import logging
@@ -45,7 +45,9 @@ import keyring
 import keyring.errors
 from mcp import server, types
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import (
+    StreamableHTTPTransport,
+)
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 
@@ -505,16 +507,72 @@ class ConnectionManager:
         self._commands: asyncio.Queue[_ConnectionCommand] = asyncio.Queue()
         self._owner_task: asyncio.Task[None] | None = None
 
+    @staticmethod
+    def _build_http_client(jwt: str) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {jwt}"},
+            timeout=httpx.Timeout(30, read=60 * 5),
+        )
+
+    @staticmethod
+    @asynccontextmanager
+    async def _post_only_streamablehttp_client(
+        url: str,
+        jwt: str,
+    ):
+        """
+        StreamableHTTP client variant that never opens standalone GET SSE.
+        """
+        read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
+        write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
+        transport = StreamableHTTPTransport(url)
+
+        async with anyio.create_task_group() as tg:
+            try:
+                async with ConnectionManager._build_http_client(jwt) as client:
+                    def start_get_stream() -> None:
+                        # Intentionally no-op for stateless remote servers.
+                        return
+
+                    tg.start_soon(
+                        transport.post_writer,
+                        client,
+                        write_stream_reader,
+                        read_stream_writer,
+                        write_stream,
+                        start_get_stream,
+                        tg,
+                    )
+
+                    try:
+                        yield (
+                            read_stream,
+                            write_stream,
+                            transport.get_session_id,
+                        )
+                    finally:
+                        if transport.session_id:
+                            await transport.terminate_session(client)
+                        tg.cancel_scope.cancel()
+            finally:
+                await read_stream_writer.aclose()
+                await write_stream.aclose()
+
+    def _open_transport(
+        self,
+        url: str,
+        jwt: str,
+    ):
+        # Remote server is intentionally stateless; standalone GET SSE is unsupported.
+        return self._post_only_streamablehttp_client(url, jwt)
+
     async def _open_connection(
         self, url: str, jwt: str
     ) -> tuple[AsyncExitStack, ClientSession, Any]:
         stack = AsyncExitStack()
         try:
             read, write, _ = await stack.enter_async_context(
-                streamablehttp_client(
-                    url=url,
-                    headers={"Authorization": f"Bearer {jwt}"},
-                )
+                self._open_transport(url, jwt)
             )
             session = await stack.enter_async_context(ClientSession(read, write))
             init_result = await session.initialize()
