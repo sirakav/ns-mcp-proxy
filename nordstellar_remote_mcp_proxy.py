@@ -7,10 +7,12 @@ using that JWT as a Bearer token.  Re-authenticates transparently when the
 token expires.
 
 Usage:
-  uvx --from git+https://github.com/sirakav/ns-mcp-proxy \\
-      nordstellar-remote-mcp-proxy <remote_mcp_url>
+  nordstellar-remote-mcp-proxy <remote_mcp_url>
 
-  e.g.  nordstellar-remote-mcp-proxy https://platform-mcp.nordstellar.com/mcp
+  Or set NORDSTELLAR_REMOTE_MCP_URL (e.g. MCPB / Claude Desktop extensions).
+
+  uvx --from git+https://github.com/sirakav/ns-mcp-proxy \\
+      nordstellar-remote-mcp-proxy https://platform-mcp.nordstellar.com/mcp
 
 Cursor mcp.json:
   "nordstellar-graphql": {
@@ -25,6 +27,7 @@ Cursor mcp.json:
 
 import asyncio
 import base64
+import os
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -1156,15 +1159,19 @@ async def _run(url: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
+    url = (
+        os.environ.get("NORDSTELLAR_REMOTE_MCP_URL", "").strip()
+        or (sys.argv[1] if len(sys.argv) > 1 else "")
+    )
+    if not url:
         print(
-            "Usage: proxy.py <remote_mcp_url>\n"
-            "  e.g. proxy.py http://localhost:8080/mcp",
+            "Usage: nordstellar-remote-mcp-proxy <remote_mcp_url>\n"
+            "  Or set NORDSTELLAR_REMOTE_MCP_URL.\n"
+            "  e.g. nordstellar-remote-mcp-proxy http://localhost:8080/mcp",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    url = sys.argv[1]
     _validate_mcp_url(url)
     log.info("Starting NordStellar MCP proxy → %s", url)
     asyncio.run(_run(url))

@@ -1,0 +1,48 @@
+# Build and attach a Claude Desktop MCP Bundle (.mcpb) when a GitHub Release is published.
+# Requires a release tag like v0.1.0; manifest "version" is set to the tag (without leading v).
+
+name: Release MCPB
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Sync manifest version with release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$TAG" ]; then
+            echo "Release tag must look like v1.2.3 (got: $TAG)" >&2
+            exit 1
+          fi
+          tmp="$(mktemp)"
+          jq --arg v "$VERSION" '.version = $v' manifest.json > "$tmp"
+          mv "$tmp" manifest.json
+
+      - name: Validate and pack MCP bundle
+        run: |
+          set -euo pipefail
+          npx --yes @anthropic-ai/mcpb@latest validate .
+          npx --yes @anthropic-ai/mcpb@latest pack . "nordstellar-remote-mcp-proxy-${{ github.event.release.tag_name }}.mcpb"
+
+      - name: Upload .mcpb to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.mcpb"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
