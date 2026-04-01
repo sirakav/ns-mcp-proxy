@@ -58,24 +58,31 @@ from mcp.shared.exceptions import McpError
 
 T = TypeVar("T")
 
-logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.INFO,
-    format="[%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("nordstellar-proxy")
-
 BACKEND_BASE = "https://platform-api.nordstellar.com"
-
 _LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 _ALLOWED_SCHEMES = {"http", "https"}
 
+# Refresh is triggered this many seconds before the JWT's exp claim to avoid races.
+_REFRESH_SKEW_SECONDS = 300
+
+_KEYRING_SERVICE = "NordStellar MCP"
+_KEYRING_ACCOUNT = "session-cookies"
+
+_PARENT_WATCHDOG_INTERVAL = 5.0
+_SHUTDOWN_TIMEOUT = 10
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 _JINJA_ENV = Environment(
     loader=FileSystemLoader(_TEMPLATES_DIR),
     autoescape=True,
 )
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="[%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("nordstellar-proxy")
 
 
 def _validate_mcp_url(url: str) -> None:
@@ -118,10 +125,6 @@ def _oauth_state_from_auth_url(auth_url: str) -> str:
     return states[0] if states else ""
 
 
-# Refresh is triggered this many seconds before the JWT's exp claim to avoid races.
-_REFRESH_SKEW_SECONDS = 300
-
-
 def _jwt_exp(jwt: str) -> float | None:
     """Return the exp claim of a JWT as a Unix timestamp, or None on any error."""
     try:
@@ -139,9 +142,6 @@ def _jwt_exp(jwt: str) -> float | None:
 # ---------------------------------------------------------------------------
 # Persistent cookie storage (keyring with in-memory fallback)
 # ---------------------------------------------------------------------------
-
-_KEYRING_SERVICE = "NordStellar MCP"
-_KEYRING_ACCOUNT = "session-cookies"
 
 
 class _CookieBackend:
@@ -1112,8 +1112,6 @@ async def _token_refresh_daemon(
 # Parent process watchdog
 # ---------------------------------------------------------------------------
 
-_PARENT_WATCHDOG_INTERVAL = 5.0
-
 
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a process with the given PID is still running."""
@@ -1161,8 +1159,6 @@ async def _parent_watchdog(initial_ppid: int) -> None:
 # ---------------------------------------------------------------------------
 # Shutdown helpers
 # ---------------------------------------------------------------------------
-
-_SHUTDOWN_TIMEOUT = 10
 
 
 def _schedule_hard_exit() -> None:
