@@ -113,9 +113,8 @@ def _oauth_state_from_auth_url(auth_url: str) -> str:
     return states[0] if states else ""
 
 
-# Matches RefreshTokenTimeSkewInSeconds in the NordStellar backend — refresh is
-# triggered this many seconds before the JWT's exp claim to avoid races.
-_REFRESH_SKEW_SECONDS = 60
+# Refresh is triggered this many seconds before the JWT's exp claim to avoid races.
+_REFRESH_SKEW_SECONDS = 300
 
 
 def _jwt_exp(jwt: str) -> float | None:
