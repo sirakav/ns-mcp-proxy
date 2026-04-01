@@ -35,7 +35,9 @@ import json
 import logging
 from pathlib import Path
 import secrets
+import signal
 import sys
+import threading
 import time
 from typing import Any, TypeVar
 import urllib.parse
@@ -1060,15 +1062,14 @@ async def _token_refresh_daemon(
             await _suspend()
             continue
 
-        sleep_for = exp - time.time() - _REFRESH_SKEW_SECONDS
-        if sleep_for > 0:
-            log.debug(
-                "Token refresh daemon: next refresh in %.1fs (exp=%s skew=%ds)",
-                sleep_for,
-                exp,
-                _REFRESH_SKEW_SECONDS,
-            )
-            await asyncio.sleep(sleep_for)
+        sleep_for = max(exp - time.time() - _REFRESH_SKEW_SECONDS, 30)
+        log.debug(
+            "Token refresh daemon: next refresh in %.1fs (exp=%s skew=%ds)",
+            sleep_for,
+            exp,
+            _REFRESH_SKEW_SECONDS,
+        )
+        await asyncio.sleep(sleep_for)
 
         log.info("Token refresh daemon: proactively refreshing token...")
         refreshed = False
@@ -1108,16 +1109,106 @@ async def _token_refresh_daemon(
 
 
 # ---------------------------------------------------------------------------
+# Parent process watchdog
+# ---------------------------------------------------------------------------
+
+_PARENT_WATCHDOG_INTERVAL = 5.0
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is still running."""
+    if sys.platform == "win32":
+        # On Windows os.kill with signal 0 is not reliable; use ctypes.
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+async def _parent_watchdog(initial_ppid: int) -> None:
+    """
+    Exit immediately when the parent process is gone.
+
+    On macOS/Linux, a child whose parent exits is reparented to PID 1
+    (launchd / init), so os.getppid() changes.  On Windows the original
+    ppid is retained but the process handle becomes invalid, so we fall
+    back to probing whether the PID is still alive.
+
+    Uses os._exit() because the event loop itself may be the source of
+    the CPU spin (e.g. kqueue busy-wake on a dead pipe fd).
+    """
+    while True:
+        await asyncio.sleep(_PARENT_WATCHDOG_INTERVAL)
+        ppid_changed = os.getppid() != initial_ppid
+        parent_dead = not _is_pid_alive(initial_ppid)
+        if ppid_changed or parent_dead:
+            log.warning(
+                "Parent process gone (was pid %d). Exiting.",
+                initial_ppid,
+            )
+            os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Shutdown helpers
+# ---------------------------------------------------------------------------
+
+_SHUTDOWN_TIMEOUT = 10
+
+
+def _schedule_hard_exit() -> None:
+    """
+    Start a daemon thread that calls os._exit after _SHUTDOWN_TIMEOUT seconds.
+
+    Guarantees the process dies even if the async cleanup is deadlocked or
+    the event loop is stuck in a busy-wake state.
+    """
+
+    def _force() -> None:
+        time.sleep(_SHUTDOWN_TIMEOUT)
+        log.warning("Graceful shutdown timed out after %ds, forcing exit.", _SHUTDOWN_TIMEOUT)
+        os._exit(1)
+
+    threading.Thread(target=_force, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
 async def _run(url: str) -> None:
+    initial_ppid = os.getppid()
     auth = AuthState()
     conn = ConnectionManager()
     reauth_lock = asyncio.Lock()
     token_refreshed = asyncio.Event()
-    refresh_task: asyncio.Task[None] | None = None
+    background_tasks: list[asyncio.Task[None]] = []
+
+    # -- Signal handling -------------------------------------------------------
+    # loop.add_signal_handler() is only available on Unix (ProactorEventLoop
+    # on Windows raises NotImplementedError).  Gracefully skip if unsupported.
+    shutdown_event = asyncio.Event()
+    if sys.platform != "win32":
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: (
+                    log.warning("Received %s, shutting down.", signal.Signals(s).name),
+                    shutdown_event.set(),
+                ),
+            )
+
     try:
         for attempt in range(2):
             await auth.ensure_authenticated()
@@ -1134,25 +1225,51 @@ async def _run(url: str) -> None:
                     continue
                 raise
 
-        refresh_task = asyncio.create_task(
-            _token_refresh_daemon(auth, conn, url, reauth_lock, token_refreshed),
-            name="nordstellar-proxy-token-refresh-daemon",
+        background_tasks.append(
+            asyncio.create_task(
+                _token_refresh_daemon(auth, conn, url, reauth_lock, token_refreshed),
+                name="nordstellar-proxy-token-refresh-daemon",
+            )
+        )
+        background_tasks.append(
+            asyncio.create_task(
+                _parent_watchdog(initial_ppid),
+                name="nordstellar-proxy-parent-watchdog",
+            )
         )
 
         app = await _create_proxy_server(conn, auth, url, reauth_lock, token_refreshed)
 
         async with stdio_server() as (read_stream, write_stream):
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options(),
+            run_task = asyncio.create_task(
+                app.run(
+                    read_stream,
+                    write_stream,
+                    app.create_initialization_options(),
+                )
             )
+            shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+            done, _ = await asyncio.wait(
+                [run_task, shutdown_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_waiter in done:
+                run_task.cancel()
+            shutdown_waiter.cancel()
+            for t in done:
+                if t is not shutdown_waiter:
+                    exc = t.exception()
+                    if exc is not None:
+                        raise exc
     finally:
-        if refresh_task is not None and not refresh_task.done():
-            refresh_task.cancel()
+        _schedule_hard_exit()
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        for task in background_tasks:
             try:
-                await refresh_task
-            except asyncio.CancelledError:
+                await task
+            except (asyncio.CancelledError, Exception):
                 pass
         await conn.close()
         await auth.aclose()
