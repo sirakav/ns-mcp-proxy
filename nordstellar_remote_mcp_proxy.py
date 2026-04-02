@@ -560,8 +560,9 @@ class ConnectionManager:
                             transport.get_session_id,
                         )
                     finally:
-                        if transport.session_id:
-                            await transport.terminate_session(client)
+                        # Remote server is stateless — no session to terminate.
+                        # Skip the DELETE to avoid a pointless round-trip that
+                        # would also fail with 401 when the JWT has expired.
                         tg.cancel_scope.cancel()
             finally:
                 await read_stream_writer.aclose()
