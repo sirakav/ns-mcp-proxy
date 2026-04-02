@@ -535,15 +535,23 @@ class ConnectionManager:
                         # Intentionally no-op for stateless remote servers.
                         return
 
-                    tg.start_soon(
-                        transport.post_writer,
-                        client,
-                        write_stream_reader,
-                        read_stream_writer,
-                        write_stream,
-                        start_get_stream,
-                        tg,
-                    )
+                    async def _guarded_post_writer() -> None:
+                        try:
+                            await transport.post_writer(
+                                client,
+                                write_stream_reader,
+                                read_stream_writer,
+                                write_stream,
+                                start_get_stream,
+                                tg,
+                            )
+                        finally:
+                            # Eagerly close the writer so any pending
+                            # read_stream.receive() unblocks with EndOfStream
+                            # instead of hanging until the generator is re-entered.
+                            await read_stream_writer.aclose()
+
+                    tg.start_soon(_guarded_post_writer)
 
                     try:
                         yield (
@@ -724,6 +732,65 @@ class ConnectionManager:
         await self._owner_task
         self._owner_task = None
 
+    async def force_close(self) -> None:
+        """Cancel the connection owner task and clean up immediately.
+
+        Unlike close(), this does not send a command through the queue —
+        it directly cancels the owner task.  Safe to call when the owner
+        may be stuck in cleanup and no longer processing commands.
+        """
+        if self._owner_task is None:
+            return
+        if not self._owner_task.done():
+            self._owner_task.cancel()
+        try:
+            await self._owner_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._owner_task = None
+        self._session = None
+        self.capabilities = None
+
+    async def execute(self, coro: Awaitable[T]) -> T:
+        """Await *coro*, but cancel it if the connection owner task dies.
+
+        The MCP SDK's ClientSession does not cancel pending request futures
+        when the underlying transport crashes (e.g. HTTP 401 kills the
+        StreamableHTTP post_writer).  This leaves call_tool() and similar
+        calls hanging forever.
+
+        By racing the coroutine against the owner task we guarantee a
+        prompt RuntimeError("Not connected to remote MCP server") instead
+        of an indefinite hang.
+        """
+        task = asyncio.ensure_future(coro)
+        owner = self._owner_task
+
+        if owner is None:
+            return await task
+
+        if owner.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise RuntimeError("Not connected to remote MCP server")
+
+        done, _ = await asyncio.wait(
+            {task, owner},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            return task.result()
+
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        raise RuntimeError("Not connected to remote MCP server")
+
     @property
     def session(self) -> ClientSession:
         if self._session is None:
@@ -862,6 +929,8 @@ async def _create_proxy_server(
 
     async def _reauth_and_reconnect() -> None:
         async with _reauth_lock:
+            await conn.force_close()
+
             need_reauth = True
             if auth.is_authenticated():
                 try:
@@ -889,7 +958,7 @@ async def _create_proxy_server(
         """
         for attempt in range(2):
             try:
-                return await coro_factory()
+                return await conn.execute(coro_factory())
             except Exception as exc:  # noqa: BLE001
                 if attempt == 0 and _is_auth_exception(exc):
                     log.warning(
