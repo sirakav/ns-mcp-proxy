@@ -62,9 +62,6 @@ BACKEND_BASE = "https://platform-api.nordstellar.com"
 _LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 _ALLOWED_SCHEMES = {"http", "https"}
 
-# Refresh is triggered this many seconds before the JWT's exp claim to avoid races.
-_REFRESH_SKEW_SECONDS = 300
-
 _KEYRING_SERVICE = "NordStellar MCP"
 _KEYRING_ACCOUNT = "session-cookies"
 
@@ -444,21 +441,21 @@ class AuthState:
         """Remove the AccessToken cookie so the next ensure_authenticated call is forced to refresh."""
         self._client.cookies.delete("AccessToken")
 
-    async def ensure_authenticated(self) -> None:
+    async def ensure_authenticated(self, *, force_refresh: bool = False) -> None:
         """Refresh or run browser login, mirroring ensureAuthenticated in refresh.go."""
-        if self.is_authenticated():
+        if self.is_authenticated() and not force_refresh:
             try:
                 jwt = self.extract_jwt()
                 exp = _jwt_exp(jwt)
-                if exp is not None and exp - time.time() > _REFRESH_SKEW_SECONDS:
+                if exp is not None and exp - time.time() > 0:
                     return
-                log.info("AccessToken expired or expiring soon.")
             except Exception:
                 log.info("Could not validate stored token.")
         log.info("Attempting token refresh...")
         if await self._refresh_session():
             log.info("Token refreshed successfully.")
             return
+        self.invalidate()
         log.info("Starting browser login flow...")
         await self._login_flow()
 
@@ -850,7 +847,6 @@ async def _create_proxy_server(
     auth: AuthState,
     url: str,
     reauth_lock: asyncio.Lock,
-    token_refreshed: asyncio.Event,
 ) -> server.Server:
     """
     Build a local MCP server whose handlers forward every call through conn.
@@ -866,27 +862,11 @@ async def _create_proxy_server(
 
     async def _reauth_and_reconnect() -> None:
         async with _reauth_lock:
-            need_reauth = True
-            if auth.is_authenticated():
-                try:
-                    jwt = auth.extract_jwt()
-                    exp = _jwt_exp(jwt)
-                    if exp is not None and exp - time.time() > _REFRESH_SKEW_SECONDS:
-                        need_reauth = False
-                except Exception:
-                    pass
-
-            if need_reauth:
-                log.info("Auth/session error detected — re-authenticating and reconnecting...")
-                auth.invalidate()
-                await auth.ensure_authenticated()
-                token_refreshed.set()
-            else:
-                log.info("Token still valid — reconnecting without re-authentication...")
-
+            log.info("Auth/session error detected — re-authenticating and reconnecting...")
+            await auth.ensure_authenticated(force_refresh=True)
             jwt = auth.extract_jwt()
             await conn.connect(url, jwt)
-            log.info("Reconnected%s.", " with refreshed token" if need_reauth else "")
+            log.info("Reconnected with refreshed token.")
 
     async def _with_reauth(coro_factory: "Callable[[], Awaitable[T]]") -> T:
         """
@@ -1017,98 +997,6 @@ async def _create_proxy_server(
 
 
 # ---------------------------------------------------------------------------
-# Proactive token refresh daemon
-# ---------------------------------------------------------------------------
-
-
-async def _token_refresh_daemon(
-    auth: AuthState,
-    conn: ConnectionManager,
-    url: str,
-    reauth_lock: asyncio.Lock,
-    token_refreshed: asyncio.Event,
-) -> None:
-    """
-    Background task that proactively refreshes the AccessToken before it expires.
-
-    Strategy (mirrors TokenRefreshService in the .NET backend):
-      1. Decode the current JWT's exp claim.
-      2. Sleep until exp - REFRESH_SKEW_SECONDS.
-      3. Acquire reauth_lock (shared with request handlers).
-      4. Call POST /auth/refresh-token (via _refresh_session).
-      5. On success, reconnect ConnectionManager with the new JWT.
-      6. On failure, suspend until a request handler re-authenticates via browser
-         login and signals token_refreshed.
-    """
-
-    async def _suspend() -> None:
-        log.warning(
-            "Token refresh daemon: refresh token expired. "
-            "Suspending until next successful re-authentication."
-        )
-        token_refreshed.clear()
-        await token_refreshed.wait()
-        log.info("Token refresh daemon: resuming after re-authentication.")
-
-    while True:
-        try:
-            jwt = auth.extract_jwt()
-        except Exception:
-            await _suspend()
-            continue
-
-        exp = _jwt_exp(jwt)
-        if exp is None:
-            await _suspend()
-            continue
-
-        sleep_for = max(exp - time.time() - _REFRESH_SKEW_SECONDS, 30)
-        log.debug(
-            "Token refresh daemon: next refresh in %.1fs (exp=%s skew=%ds)",
-            sleep_for,
-            exp,
-            _REFRESH_SKEW_SECONDS,
-        )
-        await asyncio.sleep(sleep_for)
-
-        log.info("Token refresh daemon: proactively refreshing token...")
-        refreshed = False
-        try:
-            async with reauth_lock:
-                try:
-                    current_jwt = auth.extract_jwt()
-                    current_exp = _jwt_exp(current_jwt)
-                    if (
-                        current_exp is not None
-                        and current_exp - time.time() > _REFRESH_SKEW_SECONDS
-                    ):
-                        log.info(
-                            "Token refresh daemon: token already refreshed by "
-                            "another actor, skipping."
-                        )
-                        continue
-                except Exception:
-                    pass
-
-                refreshed = await auth._refresh_session()
-                if refreshed:
-                    new_jwt = auth.extract_jwt()
-                    await conn.connect(url, new_jwt)
-                    log.info(
-                        "Token refresh daemon: token refreshed and connection updated."
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning("Token refresh daemon: error during refresh: %s", exc)
-            await _suspend()
-            continue
-
-        if not refreshed:
-            await _suspend()
-
-
-# ---------------------------------------------------------------------------
 # Parent process watchdog
 # ---------------------------------------------------------------------------
 
@@ -1187,7 +1075,6 @@ async def _run(url: str) -> None:
     auth = AuthState()
     conn = ConnectionManager()
     reauth_lock = asyncio.Lock()
-    token_refreshed = asyncio.Event()
     background_tasks: list[asyncio.Task[None]] = []
 
     # -- Signal handling -------------------------------------------------------
@@ -1217,16 +1104,9 @@ async def _run(url: str) -> None:
                     log.warning(
                         "Initial connection failed with auth error, re-authenticating..."
                     )
-                    auth.invalidate()
                     continue
                 raise
 
-        background_tasks.append(
-            asyncio.create_task(
-                _token_refresh_daemon(auth, conn, url, reauth_lock, token_refreshed),
-                name="nordstellar-proxy-token-refresh-daemon",
-            )
-        )
         background_tasks.append(
             asyncio.create_task(
                 _parent_watchdog(initial_ppid),
@@ -1234,7 +1114,7 @@ async def _run(url: str) -> None:
             )
         )
 
-        app = await _create_proxy_server(conn, auth, url, reauth_lock, token_refreshed)
+        app = await _create_proxy_server(conn, auth, url, reauth_lock)
 
         async with stdio_server() as (read_stream, write_stream):
             run_task = asyncio.create_task(
