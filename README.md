@@ -46,6 +46,12 @@ Ask your AI assistant things like “What projects do I have?” or “Show me r
   - **Windows** — Credential Locker
   - **Linux** — Freedesktop Secret Service (GNOME Keyring / KWallet). Requires `gnome-keyring` or `kwallet` to be available; on headless systems, see the [keyring docs](https://pypi.org/project/keyring/) for setup instructions.
 
+## Community
+
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+
 ## Need help?
 
 Contact your NordStellar administrator for the correct MCP endpoint URL and any access questions.
