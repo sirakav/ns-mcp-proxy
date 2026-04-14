@@ -37,6 +37,33 @@ When you first use NordStellar, a browser window will open. Sign in with your No
 
 Ask your AI assistant things like “What projects do I have?” or “Show me recent activity” and it will use your NordStellar data to answer.
 
+## Credential storage
+
+Session cookies are saved in your OS credential store under the service name `NordStellar MCP`:
+
+- **macOS** — Keychain
+- **Windows** — Credential Locker
+- **Linux** — Freedesktop Secret Service (for example GNOME Keyring or KWallet)
+
+If no secure credential store is available, the proxy keeps credentials in memory only. In that mode, credentials are lost when the process exits.
+
+Any application running as your user account may be able to read stored credentials through the OS credential APIs. This is the standard behavior for desktop credential stores.
+
+### Clear stored credentials
+
+To remove stored session cookies, use one of the following:
+
+- Any platform: run `nordstellar-remote-mcp-proxy --logout`
+- macOS: run `security delete-generic-password -s "NordStellar MCP"`
+- Windows: remove the Generic Credential named `NordStellar MCP` from Credential Manager
+- Linux: remove the `NordStellar MCP` secret from your Secret Service keyring (for example with Seahorse or KWallet Manager)
+
+## Token lifetime and refresh behavior
+
+This proxy stores whatever authentication cookies the NordStellar backend sets and refreshes the session through `POST /auth/refresh-token` when it needs a fresh `AccessToken`.
+
+The repository does not define backend token lifetimes or refresh-token rotation policy. The `AccessToken` cookie payload includes an `expires_in` field, but the exact TTLs and whether refresh cookies rotate are backend-controlled and should be confirmed with NordStellar platform operators.
+
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)

@@ -8,6 +8,7 @@ token expires.
 
 Usage:
   nordstellar-remote-mcp-proxy <remote_mcp_url>
+  nordstellar-remote-mcp-proxy --logout
 
   Or set NORDSTELLAR_REMOTE_MCP_URL (e.g. MCPB / Claude Desktop extensions).
 
@@ -25,8 +26,10 @@ Cursor mcp.json:
   }
 """
 
+import argparse
 import asyncio
 import base64
+import ipaddress
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -82,12 +85,90 @@ logging.basicConfig(
 log = logging.getLogger("nordstellar-proxy")
 
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nordstellar-remote-mcp-proxy",
+        description=(
+            "Authenticate to NordStellar and proxy a local stdio MCP session "
+            "to a remote StreamableHTTP MCP server."
+        ),
+    )
+    parser.add_argument(
+        "remote_mcp_url",
+        nargs="?",
+        help=(
+            "Remote MCP server URL. If omitted, NORDSTELLAR_REMOTE_MCP_URL is used."
+        ),
+    )
+    parser.add_argument(
+        "--logout",
+        action="store_true",
+        help="Clear stored NordStellar session cookies from the OS keyring and exit.",
+    )
+    return parser
+
+
+def _count_stored_cookies(value: str) -> int | None:
+    try:
+        cookies = json.loads(value)
+    except Exception:
+        return None
+    if isinstance(cookies, dict):
+        return len(cookies)
+    return None
+
+
+def _logout() -> int:
+    backend_name = type(keyring.get_keyring()).__name__
+    if backend_name == "NullKeyring":
+        print(
+            "NordStellar: No secure keyring backend is available; nothing to clear.",
+            file=sys.stderr,
+        )
+        return 0
+
+    try:
+        value = keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+    except Exception as exc:
+        print(f"NordStellar: Failed to access keyring: {exc}", file=sys.stderr)
+        return 1
+
+    if not value:
+        print(
+            f"NordStellar: No stored cookies found in {backend_name}.",
+            file=sys.stderr,
+        )
+        return 0
+
+    try:
+        keyring.delete_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+    except keyring.errors.PasswordDeleteError as exc:
+        print(f"NordStellar: Failed to clear stored cookies: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"NordStellar: Failed to clear stored cookies: {exc}", file=sys.stderr)
+        return 1
+
+    cookie_count = _count_stored_cookies(value)
+    if cookie_count is None:
+        print(
+            f"NordStellar: Cleared stored cookies from {backend_name}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"NordStellar: Cleared {cookie_count} stored cookie(s) from {backend_name}.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _validate_mcp_url(url: str) -> None:
     """
     Validate the remote MCP server URL.
 
     Only http and https schemes are permitted. Plain HTTP is allowed only for
-    loopback addresses (localhost, 127.0.0.1, ::1, or the 127.x.x.x range)
+    localhost and loopback IP literals (for example 127.0.0.1 or ::1)
     because sending Bearer tokens over unencrypted connections on non-loopback
     networks exposes credentials in cleartext.
     """
@@ -104,7 +185,12 @@ def _validate_mcp_url(url: str) -> None:
         )
 
     hostname = (parsed.hostname or "").lower()
-    is_loopback = hostname in _LOOPBACK_HOSTNAMES or hostname.startswith("127.")
+    is_loopback = hostname in _LOOPBACK_HOSTNAMES
+    if not is_loopback:
+        try:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = False
     if scheme == "http" and not is_loopback:
         raise SystemExit(
             f"Plain HTTP is not allowed for non-loopback host '{hostname}'. "
@@ -1235,24 +1321,29 @@ async def _run(url: str) -> None:
         await auth.aclose()
 
 
-def main() -> None:
-    url = (
-        os.environ.get("NORDSTELLAR_REMOTE_MCP_URL", "").strip()
-        or (sys.argv[1] if len(sys.argv) > 1 else "")
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+
+    if args.logout:
+        return _logout()
+
+    url = os.environ.get("NORDSTELLAR_REMOTE_MCP_URL", "").strip() or (
+        args.remote_mcp_url or ""
     )
     if not url:
+        _build_arg_parser().print_usage(sys.stderr)
         print(
-            "Usage: nordstellar-remote-mcp-proxy <remote_mcp_url>\n"
-            "  Or set NORDSTELLAR_REMOTE_MCP_URL.\n"
-            "  e.g. nordstellar-remote-mcp-proxy http://localhost:8080/mcp",
+            "Set NORDSTELLAR_REMOTE_MCP_URL or pass <remote_mcp_url>.\n"
+            "Use --logout to clear stored NordStellar session cookies.",
             file=sys.stderr,
         )
-        sys.exit(1)
+        return 1
 
     _validate_mcp_url(url)
     log.info("Starting NordStellar MCP proxy → %s", url)
     asyncio.run(_run(url))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
